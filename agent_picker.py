@@ -1,6 +1,7 @@
 """
 AGENT PICKER (A-P) - автовыбор агента по картинке иконки + клики через AutoHotkey.
 Не лезет в процесс игры: только скриншоты экрана и клики.
+AutoHotkey запускается один раз вместе с программой и ждёт команд (WM_COPYDATA).
 
 Запуск из исходников:  python agent_picker.py      (лучше от администратора)
 Сборка в .exe:         build.bat
@@ -10,6 +11,7 @@ AGENT PICKER (A-P) - автовыбор агента по картинке ик�
 """
 import base64
 import ctypes
+from ctypes import wintypes
 import json
 import os
 import queue
@@ -82,35 +84,104 @@ DEFAULTS = {
     "hk_auto": "f9",
     "hk_pick": "f11",
     "hk_lockin": "f7",
+    "notify_sound": True,    # звуковой сигнал при вкл/выкл авто-режима
+    "notify_popup": True,    # плашка поверх игры при вкл/выкл авто-режима
 }
 
-# Плейсхолдеры: {{NAME}} {{AGENT_X}} {{AGENT_Y}} {{LOCK_X}} {{LOCK_Y}}
+AHK_TEMPLATE_VERSION = "AP-SERVER-V2"   # по этой метке понимаем, что шаблон уже в новом формате
+AHK_WINDOW_TITLE = "AgentPickerAHK"     # заголовок скрытого окна AHK-сервера (должен совпадать с шаблоном)
+
+# AHK запускается один раз и ждёт команд от программы (WM_COPYDATA), поэтому на выбор агента
+# не тратится время на старт процесса. Править можно только блок "ВЫБОР АГЕНТА".
 DEFAULT_AHK_TEMPLATE = """#Requires AutoHotkey v2.0
 #SingleInstance Force
+#NoTrayIcon
+Persistent
 CoordMode "Mouse", "Screen"
 
-; Агент: {{NAME}}
-AgentX := {{AGENT_X}}
-AgentY := {{AGENT_Y}}
-LockX := {{LOCK_X}}
-LockY := {{LOCK_Y}}
+; AP-SERVER-V2
+; AHK запускается вместе с Agent Picker и ждёт команд. Править можно только блок
+; "ВЫБОР АГЕНТА". После правки нажми "ПЕРЕЗАПУСТИТЬ AHK" в настройках программы.
+
+; ===================== ВЫБОР АГЕНТА =====================
 Repeats := 4   ; сколько раз повторить пару "агент + выбрать"
 
-Loop Repeats {
-    MouseClick "left", AgentX, AgentY, 1, 0, "D"
-    Sleep 25
-    MouseClick "left", AgentX, AgentY, 1, 0, "U"
+PickAgent(Name, AgentX, AgentY, LockX, LockY) {
+    Loop Repeats {
+        MouseClick "left", AgentX, AgentY, 1, 0, "D"
+        Sleep 25
+        MouseClick "left", AgentX, AgentY, 1, 0, "U"
 
-    Sleep 30
+        Sleep 30
 
-    MouseClick "left", LockX, LockY, 1, 0, "D"
-    Sleep 25
-    MouseClick "left", LockX, LockY, 1, 0, "U"
+        MouseClick "left", LockX, LockY, 1, 0, "D"
+        Sleep 25
+        MouseClick "left", LockX, LockY, 1, 0, "U"
 
-    Sleep 60
+        Sleep 60
+    }
 }
-ExitApp
+
+; ===================== СЛУЖЕБНАЯ ЧАСТЬ (не менять) =====================
+Busy := false
+Srv := Gui(, "AgentPickerAHK")
+OnMessage(0x4A, OnCopyData)   ; WM_COPYDATA
+
+OnCopyData(wParam, lParam, msg, hwnd) {
+    cmd := StrGet(NumGet(lParam, 2 * A_PtrSize, "Ptr"), "UTF-16")
+    p := StrSplit(cmd, "|")
+    try {
+        switch p[1] {
+            case "PICK":     ; PICK|имя|ax|ay|lx|ly - выполняется в фоне, ответ сразу
+                SetTimer(RunPick.Bind(p[2], Integer(p[3]), Integer(p[4]), Integer(p[5]), Integer(p[6])), -1)
+            case "SCROLL":   ; SCROLL|cx|cy|nx|ny|вверх|вниз|щелчков_вверх - ответ после прокрутки
+                DoScroll(Integer(p[2]), Integer(p[3]), Integer(p[4]), Integer(p[5]), Integer(p[6]), Integer(p[7]), Integer(p[8]))
+            case "EXIT":
+                SetTimer(() => ExitApp(), -1)
+        }
+    }
+    return 1
+}
+
+RunPick(Name, AX, AY, LX, LY) {
+    global Busy
+    if Busy
+        return
+    Busy := true
+    try PickAgent(Name, AX, AY, LX, LY)
+    Busy := false
+}
+
+DoScroll(cx, cy, nx, ny, toTop, down, topNotches) {
+    MouseMove cx, cy, 0
+    Sleep 40
+    if toTop {
+        MouseClick "WheelUp", cx, cy, topNotches, 0
+        Sleep 80
+    }
+    Loop down {
+        MouseClick "WheelDown", cx, cy, 1, 0
+        Sleep 20
+    }
+    Sleep 40
+    MouseMove nx, ny, 0
+}
 """
+
+
+def ensure_template():
+    """Создаёт шаблон AHK; старый формат (скрипт на каждого агента) сохраняет в .old и заменяет."""
+    msgs = []
+    if os.path.exists(AHK_TEMPLATE_PATH):
+        with open(AHK_TEMPLATE_PATH, "r", encoding="utf-8-sig") as f:
+            text = f.read()
+        if AHK_TEMPLATE_VERSION in text:
+            return msgs
+        shutil.copy2(AHK_TEMPLATE_PATH, os.path.join(DATA_DIR, "ahk_template.old.ahk"))
+        msgs.append("Шаблон AHK обновлён до нового формата (старый сохранён как ahk_template.old.ahk).")
+    with open(AHK_TEMPLATE_PATH, "w", encoding="utf-8-sig") as f:
+        f.write(DEFAULT_AHK_TEMPLATE)
+    return msgs
 
 
 # ---------- первый запуск: папка в AppData ----------
@@ -146,9 +217,7 @@ def init_data():
             shutil.copy2(bundled, AHK_EXE)
             msgs.append("AutoHotkey runtime установлен в папку данных.")
 
-    if not os.path.exists(AHK_TEMPLATE_PATH):
-        with open(AHK_TEMPLATE_PATH, "w", encoding="utf-8") as f:
-            f.write(DEFAULT_AHK_TEMPLATE)
+    msgs.extend(ensure_template())
     if first_run:
         msgs.insert(0, f"Первый запуск: создана папка данных {DATA_DIR}")
     return msgs
@@ -180,52 +249,103 @@ def save_positions(pos):
         json.dump({k: list(v) for k, v in pos.items()}, f, ensure_ascii=False, indent=2)
 
 
-def write_ahk(name, ax, ay, lx, ly):
-    """Создаёт ahk/<name>.ahk из шаблона, возвращает путь."""
-    if not os.path.exists(AHK_TEMPLATE_PATH):
-        with open(AHK_TEMPLATE_PATH, "w", encoding="utf-8") as f:
-            f.write(DEFAULT_AHK_TEMPLATE)
-    with open(AHK_TEMPLATE_PATH, "r", encoding="utf-8-sig") as f:
-        text = f.read()
-    for key, val in (("{{NAME}}", name), ("{{AGENT_X}}", int(ax)), ("{{AGENT_Y}}", int(ay)),
-                     ("{{LOCK_X}}", int(lx)), ("{{LOCK_Y}}", int(ly))):
-        text = text.replace(key, str(val))
-    path = os.path.join(AHK_DIR, name + ".ahk")
-    with open(path, "w", encoding="utf-8-sig") as f:
-        f.write(text)
-    return path
+_u32 = ctypes.WinDLL("user32", use_last_error=True)   # отдельный экземпляр, чтобы не трогать argtypes общего windll
+_u32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+_u32.FindWindowW.restype = wintypes.HWND
+_u32.IsWindow.argtypes = [wintypes.HWND]
+_u32.IsWindow.restype = wintypes.BOOL
+_u32.SendMessageTimeoutW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+                                     wintypes.UINT, wintypes.UINT, ctypes.POINTER(ctypes.c_size_t)]
+_u32.SendMessageTimeoutW.restype = ctypes.c_ssize_t
+_u32.GetParent.argtypes = [wintypes.HWND]
+_u32.GetParent.restype = wintypes.HWND
+_u32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+_u32.GetWindowLongW.restype = ctypes.c_long
+_u32.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_long]
+_u32.SetWindowLongW.restype = ctypes.c_long
+
+WM_COPYDATA = 0x004A
+SMTO_ABORTIFHUNG = 0x0002
 
 
-def run_ahk(path):
-    exe = find_ahk_exe()
-    if exe:
-        subprocess.Popen([exe, path], cwd=AHK_DIR, creationflags=0x08000000)  # CREATE_NO_WINDOW
-    else:
-        os.startfile(path)   # запасной вариант: установленный в системе AutoHotkey v2
+class COPYDATASTRUCT(ctypes.Structure):
+    _fields_ = [("dwData", ctypes.c_size_t), ("cbData", wintypes.DWORD), ("lpData", ctypes.c_void_p)]
 
 
-def run_ahk_wait(path):
-    """Запускает AHK-скрипт и ждёт его завершения."""
-    exe = find_ahk_exe()
-    if exe:
-        subprocess.run([exe, path], cwd=AHK_DIR, creationflags=0x08000000, timeout=15)
-    else:
-        os.startfile(path)
-        time.sleep(1.2)
+class AhkServer:
+    """Постоянно работающий AHK-процесс. Команды уходят ему через WM_COPYDATA - без запуска процесса на каждый клик."""
 
+    def __init__(self):
+        self.proc = None
+        self.lock = threading.RLock()
+        self.last_error = ""
 
-def scroll_ahk_text(center, neutral, to_top, down_notches):
-    """Скрипт прокрутки списка колесом: навестись на список, (вернуть в начало), крутить вниз, увести мышь."""
-    cx, cy = center
-    nx, ny = neutral
-    lines = ["#Requires AutoHotkey v2.0", "#SingleInstance Force", 'CoordMode "Mouse", "Screen"',
-             f"MouseMove {cx}, {cy}, 0", "Sleep 40"]
-    if to_top:
-        lines += [f'MouseClick "WheelUp", {cx}, {cy}, {TOP_RESET_NOTCHES}, 0', "Sleep 80"]
-    if down_notches > 0:
-        lines += [f"Loop {int(down_notches)} {{", f'    MouseClick "WheelDown", {cx}, {cy}, 1, 0', "    Sleep 20", "}"]
-    lines += ["Sleep 40", f"MouseMove {nx}, {ny}, 0", "ExitApp"]
-    return "\n".join(lines) + "\n"
+    @staticmethod
+    def _find():
+        return _u32.FindWindowW(None, AHK_WINDOW_TITLE) or 0
+
+    def alive(self):
+        h = self._find()
+        return bool(h) and bool(_u32.IsWindow(h))
+
+    def start(self, wait=5.0):
+        """Запускает AHK-сервер, если он ещё не работает. Возвращает True, когда он готов принимать команды."""
+        with self.lock:
+            if self.alive():
+                return True
+            exe = find_ahk_exe()
+            try:
+                if exe:
+                    self.proc = subprocess.Popen([exe, AHK_TEMPLATE_PATH], cwd=AHK_DIR, creationflags=0x08000000)
+                else:
+                    os.startfile(AHK_TEMPLATE_PATH)   # запасной вариант: установленный в системе AutoHotkey v2
+            except Exception as e:
+                self.last_error = str(e)
+                return False
+            deadline = time.time() + wait
+            while time.time() < deadline:
+                if self.alive():
+                    return True
+                if self.proc is not None and self.proc.poll() is not None:
+                    self.last_error = f"AHK завершился сразу после запуска (код {self.proc.returncode}) - проверь шаблон."
+                    return False
+                time.sleep(0.02)
+            self.last_error = "AHK не создал окно для команд за отведённое время."
+            return False
+
+    def send(self, text, timeout=15000, autostart=True):
+        """Отправляет команду. Для SCROLL возвращается после окончания прокрутки, для PICK - сразу."""
+        with self.lock:
+            if autostart and not self.start():
+                raise RuntimeError("AutoHotkey не запущен: " + self.last_error)
+            hwnd = self._find()
+            if not hwnd:
+                raise RuntimeError("окно AHK-сервера не найдено")
+            buf = ctypes.create_unicode_buffer(text)
+            cds = COPYDATASTRUCT(1, ctypes.sizeof(buf), ctypes.cast(buf, ctypes.c_void_p))
+            res = ctypes.c_size_t(0)
+            ok = _u32.SendMessageTimeoutW(hwnd, WM_COPYDATA, 0, ctypes.addressof(cds),
+                                          SMTO_ABORTIFHUNG, timeout, ctypes.byref(res))
+            if not ok:
+                raise RuntimeError("AHK не ответил на команду")
+            return res.value
+
+    def stop(self):
+        with self.lock:
+            if self.alive():
+                try:
+                    self.send("EXIT", timeout=1000, autostart=False)
+                except Exception:
+                    pass
+            if self.proc is not None:
+                try:
+                    self.proc.wait(timeout=1.0)
+                except Exception:
+                    try:
+                        self.proc.terminate()
+                    except Exception:
+                        pass
+                self.proc = None
 
 
 def load_scrolls():
@@ -704,6 +824,44 @@ class NameDialog(tk.Toplevel):
         self.destroy()
 
 
+class Toast(tk.Toplevel):
+    """Плашка-уведомление поверх всех окон: не забирает фокус у игры, клики проходят сквозь неё."""
+
+    def __init__(self, app, text, sub, color, ms=1800):
+        super().__init__(app.root)
+        self.withdraw()
+        self.overrideredirect(True)
+        self.attributes("-topmost", True)
+        try:
+            self.attributes("-alpha", 0.96)
+        except tk.TclError:
+            pass
+        self.configure(bg=color)
+        inner = tk.Frame(self, bg=C["bar"], padx=px(22), pady=px(12))
+        inner.pack(padx=(px(6), 0))
+        tk.Label(inner, text=text, font=F["h1"], fg=C["cream"], bg=C["bar"]).pack()
+        if sub:
+            tk.Label(inner, text=sub, font=F["small"], fg=C["muted"], bg=C["bar"]).pack(pady=(2, 0))
+        self.update_idletasks()
+        try:   # NOACTIVATE | TOOLWINDOW | TRANSPARENT (клики насквозь), ставим до показа окна
+            hwnd = _u32.GetParent(self.winfo_id()) or self.winfo_id()
+            ex = _u32.GetWindowLongW(hwnd, -20)
+            _u32.SetWindowLongW(hwnd, -20, ex | 0x08000000 | 0x00000080 | 0x00000020)
+        except Exception:
+            pass
+        w, h = self.winfo_reqwidth(), self.winfo_reqheight()
+        x = (self.winfo_screenwidth() - w) // 2
+        self.geometry(f"+{x}+{px(70)}")
+        self.deiconify()
+        self.after(ms, self.close)
+
+    def close(self):
+        try:
+            self.destroy()
+        except tk.TclError:
+            pass
+
+
 # ---------- приложение ----------
 class App:
     def __init__(self, root, init_msgs):
@@ -721,6 +879,8 @@ class App:
         self.positions = load_positions()
         self.scrolls = load_scrolls()   # имя агента -> щелчков колеса вниз от начала списка
         self.learn = None
+        self.ahk = AhkServer()
+        self.toast = None
 
         self.build_ui()
         self.hwnd = 0
@@ -734,6 +894,7 @@ class App:
         self.update_lockin_label()
         self.poll_queue()
         threading.Thread(target=self.watcher, daemon=True).start()
+        threading.Thread(target=self.ahk_boot, daemon=True).start()   # AHK стартует сразу и ждёт команд
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
         for m in init_msgs:
@@ -868,6 +1029,19 @@ class App:
             make_entry(grid2, var, width=14, readonly=True).grid(row=i, column=1, padx=16, ipady=3)
             VButton(grid2, "ЗАДАТЬ", lambda k=key: self.capture_hotkey(k), "ghost", height=30).grid(row=i, column=2)
 
+        box4 = panel(p)
+        box4.pack(fill="x", pady=(px(12), 0))
+        in4 = tk.Frame(box4, bg=C["panel"], padx=px(16), pady=px(12))
+        in4.pack(fill="x")
+        panel_header(in4, "УВЕДОМЛЕНИЯ ОБ АВТО-РЕЖИМЕ")
+        self.v_nsound = tk.BooleanVar(value=bool(self.cfg.get("notify_sound", True)))
+        self.v_npopup = tk.BooleanVar(value=bool(self.cfg.get("notify_popup", True)))
+        for var, label in ((self.v_nsound, "Звуковой сигнал (два тона вверх - вкл, вниз - выкл)"),
+                           (self.v_npopup, "Плашка поверх игры (работает в режиме «без рамки»)")):
+            tk.Checkbutton(in4, text=label, variable=var, command=self.apply_notify, font=F["body"], fg=C["cream"],
+                           bg=C["panel"], selectcolor=C["bg"], activebackground=C["panel"],
+                           activeforeground=C["cream"], highlightthickness=0, bd=0, anchor="w").pack(fill="x", pady=(8, 0))
+
         box3 = panel(p)
         box3.pack(fill="x", pady=(px(12), 0))
         in3 = tk.Frame(box3, bg=C["panel"], padx=px(16), pady=px(12))
@@ -878,6 +1052,7 @@ class App:
         row.pack(anchor="w")
         VButton(row, "ОТКРЫТЬ ПАПКУ ДАННЫХ", lambda: os.startfile(DATA_DIR), "ghost").pack(side="left")
         VButton(row, "ШАБЛОН AHK", self.open_template, "ghost").pack(side="left", padx=8)
+        VButton(row, "ПЕРЕЗАПУСТИТЬ AHK", self.restart_ahk, "ghost").pack(side="left")
 
     def build_log(self, p):
         box = panel(p)
@@ -928,6 +1103,29 @@ class App:
         except ValueError:
             pass
 
+    def apply_notify(self):
+        self.cfg["notify_sound"] = bool(self.v_nsound.get())
+        self.cfg["notify_popup"] = bool(self.v_npopup.get())
+        save_cfg(self.cfg)
+
+    def ahk_boot(self):
+        t0 = time.perf_counter()
+        if self.ahk.start():
+            self.log(f"AutoHotkey запущен и ждёт команд ({int((time.perf_counter() - t0) * 1000)} мс).")
+        else:
+            self.log("ВНИМАНИЕ: не удалось запустить AHK-сервер: " + self.ahk.last_error)
+
+    def ahk_ensure(self):
+        if not self.ahk.alive():
+            self.ahk_boot()
+
+    def restart_ahk(self):
+        def work():
+            self.ahk.stop()
+            time.sleep(0.2)
+            self.ahk_boot()
+        threading.Thread(target=work, daemon=True).start()
+
     def open_template(self):
         try:
             subprocess.Popen(["notepad.exe", AHK_TEMPLATE_PATH])
@@ -940,6 +1138,10 @@ class App:
         except Exception:
             pass
         save_cfg(self.cfg)
+        try:
+            self.ahk.stop()
+        except Exception:
+            pass
         self.root.destroy()
 
     # ----- агенты и приоритет -----
@@ -1105,11 +1307,8 @@ class App:
                         cy = g.mon["top"] + yy + g.size // 2
                         self.positions[name] = (cx, cy)
                         save_positions(self.positions)
-                        lock = self.cfg.get("lockin")
-                        lock = tuple(lock) if lock else g.lockin_default
-                        write_ahk(name, cx, cy, lock[0], lock[1])
                     except Exception as e:
-                        self._log(f"Не удалось создать AHK для {name}: {e}")
+                        self._log(f"Не удалось сохранить позицию {name}: {e}")
         save_scrolls(self.scrolls)
         self._log(f"Страница {st['page']} (прокрутка {st['notches']}): добавлено {st['added']}, "
                   f"обновлено прокруток {st['updated']}.")
@@ -1191,6 +1390,32 @@ class App:
             self.btn_auto.set_text("ЗАПУСТИТЬ АВТО")
             self.btn_auto.set_kind("primary")
         self._log("Авто-режим: " + ("ВКЛ" if self.auto else "ВЫКЛ"))
+        self.notify_auto(self.auto)
+        if self.auto:   # на случай, если AHK-сервер закрыли - поднимаем заранее, до экрана выбора
+            threading.Thread(target=self.ahk_ensure, daemon=True).start()
+
+    def notify_auto(self, on):
+        """Звук и плашка при включении/выключении авто-режима (видно и слышно, пока открыта игра)."""
+        if self.cfg.get("notify_sound", True):
+            threading.Thread(target=self._beep, args=(on,), daemon=True).start()
+        if self.cfg.get("notify_popup", True):
+            try:
+                if self.toast is not None:
+                    self.toast.close()
+                hk = (self.cfg.get("hk_auto") or "").upper()
+                self.toast = Toast(self, "АВТО-РЕЖИМ ВКЛЮЧЁН" if on else "АВТО-РЕЖИМ ВЫКЛЮЧЕН",
+                                   f"{hk} - переключить" if hk else "", C["teal"] if on else C["red"])
+            except Exception as e:
+                self._log(f"Не удалось показать уведомление: {e}")
+
+    @staticmethod
+    def _beep(on):
+        try:
+            import winsound
+            for freq in ((700, 1000) if on else (1000, 600)):
+                winsound.Beep(freq, 90)
+        except Exception:
+            pass
 
     def update_lockin_label(self):
         p = self.cfg.get("lockin")
@@ -1201,11 +1426,6 @@ class App:
         save_cfg(self.cfg)
         self.update_lockin_label()
         self._log(f"Позиция кнопки выбора запомнена: {pos[0]},{pos[1]}")
-        try:
-            for n, (px_, py_) in self.positions.items():
-                write_ahk(n, px_, py_, int(pos[0]), int(pos[1]))
-        except Exception as e:
-            self._log(f"Не удалось обновить AHK: {e}")
 
     def lockin_button(self):
         self._log("Наведи курсор на кнопку выбора в игре - запомню через 4 секунды (или используй хоткей).")
@@ -1235,11 +1455,10 @@ class App:
         return False
 
     def scroll_list(self, g, to_top=False, down=0):
-        """Прокрутка списка агентов колесом через AutoHotkey (pyautogui-колесо в игре не срабатывает)."""
-        path = os.path.join(AHK_DIR, "_scroll.ahk")
-        with open(path, "w", encoding="utf-8-sig") as f:
-            f.write(scroll_ahk_text(g.list_center, g.neutral, to_top, down))
-        run_ahk_wait(path)
+        """Прокрутка списка агентов колесом через постоянно запущенный AutoHotkey (pyautogui-колесо в игре не срабатывает)."""
+        cx, cy = g.list_center
+        nx, ny = g.neutral
+        self.ahk.send(f"SCROLL|{cx}|{cy}|{nx}|{ny}|{int(bool(to_top))}|{int(down)}|{TOP_RESET_NOTCHES}")
         time.sleep(SCROLL_SETTLE)
 
     def scroll_to(self, g, cur, target):
@@ -1301,17 +1520,16 @@ class App:
             if not priority:
                 self.log("Приоритет пуст - добавь агентов в правый список.")
                 return
+            t0 = time.perf_counter()
             time.sleep(PICK_DELAY)   # короткая пауза, чтобы экран успел прорисоваться
             name, pos = self.find_agent(g, priority)
             if not pos:
                 self.log("Ни один агент из списка не найден или недоступен. Попробуй ещё раз (хоткей/кнопка).")
                 return
-            self.log(f"Выбираю: {name}")
             lock = self.cfg.get("lockin")
             lock = tuple(lock) if lock else g.lockin_default
-            path = write_ahk(name, pos[0], pos[1], lock[0], lock[1])
-            run_ahk(path)
-            self.log(f"Запущен AHK: {os.path.basename(path)}")
+            self.ahk.send(f"PICK|{name}|{int(pos[0])}|{int(pos[1])}|{int(lock[0])}|{int(lock[1])}")
+            self.log(f"Выбираю: {name} (команда в AHK через {int((time.perf_counter() - t0) * 1000)} мс)")
         except Exception as e:
             self.log(f"Ошибка выбора: {e}")
         finally:
